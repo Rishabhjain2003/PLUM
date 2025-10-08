@@ -11,18 +11,26 @@ app.use(cors());
 app.use(express.json());
 
 // MongoDB Connection
-const mongoUri = process.env.MONGODB_URI || '';
+const mongoUri = process.env.MONGODB_URI || 'mongodb+srv://ankush321nayak_db_user:uuiHMDGYdN0Jtb2s@cluster0.kswycqh.mongodb.net/';
 if (!mongoUri) {
   console.error('Missing MONGODB_URI in environment');
 }
 
 mongoose
   .connect(mongoUri, { dbName: process.env.MONGODB_DB || undefined })
-  .then(() => console.log('MongoDB connected'))
+  .then(async () => {
+    console.log('MongoDB connected');
+    try {
+      await User.syncIndexes();
+      console.log('User indexes ensured');
+    } catch (e) {
+      console.error('Failed to sync User indexes:', e);
+    }
+  })
   .catch((err) => console.error('MongoDB connection error:', err));
 
-// Mongoose Schema & Model
-const SavedTipSchema = new mongoose.Schema(
+// Mongoose Schema & Model (nested goals with saved_tasks)
+const SavedTaskSchema = new mongoose.Schema(
   {
     title: { type: String, required: true },
     icon_keyword: { type: String, required: true },
@@ -32,20 +40,30 @@ const SavedTipSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const GoalSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true },
+    saved_tasks: { type: [SavedTaskSchema], default: [] },
+  },
+  { _id: false }
+);
+
 const UserSchema = new mongoose.Schema(
   {
+    user_id: { type: String },
     age: { type: Number, required: true },
     gender: { type: String, required: true },
-    goal: { type: String, required: true },
-    saved_tips: { type: [SavedTipSchema], default: [] },
+    goals: { type: [GoalSchema], default: [] },
   },
-  { timestamps: true }
+  { timestamps: true, collection: 'users' }
 );
+
+UserSchema.index({ user_id: 1 }, { unique: true, sparse: true });
 
 const User = mongoose.model('User', UserSchema);
 
 // Gemini Client
-const geminiApiKey = process.env.GEMINI_API_KEY || '';
+const geminiApiKey = process.env.GEMINI_API_KEY || 'AIzaSyD4FY-u_dpG18rHMCkepb8JOsddoHQs6yU';
 if (!geminiApiKey) {
   console.error('Missing GEMINI_API_KEY in environment');
 }
@@ -118,12 +136,15 @@ app.get('/health', (_req, res) => {
 app.post('/api/profile', async (req, res) => {
   try {
     const { age, gender, goal } = req.body || {};
-    if (typeof age !== 'number' || !gender || !goal) {
-      return res.status(400).json({ error: 'Missing or invalid fields: age (number), gender, goal' });
+    if (typeof age !== 'number' || !gender) {
+      return res.status(400).json({ error: 'Missing or invalid fields: age (number), gender' });
     }
 
-    const user = await User.create({ age, gender, goal });
-    return res.json({ userId: user._id.toString() });
+    const initialGoals = goal ? [{ name: String(goal), saved_tasks: [] }] : [];
+    const user = await User.create({ age, gender, goals: initialGoals });
+    user.user_id = user._id.toString();
+    await user.save();
+    return res.json({ userId: user.user_id });
   } catch (err) {
     console.error('POST /api/profile error:', err);
     return res.status(500).json({ error: 'Failed to save profile' });
@@ -163,7 +184,7 @@ app.post('/api/tips/detail', async (req, res) => {
 // 4) Save a favorite tip
 app.post('/api/tips/save', async (req, res) => {
   try {
-    const { userId, tip } = req.body || {};
+    const { userId, tip, goalName } = req.body || {};
     if (!userId || !tip) {
       return res.status(400).json({ error: 'Missing userId or tip' });
     }
@@ -176,9 +197,16 @@ app.post('/api/tips/save', async (req, res) => {
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    user.saved_tips.push({ title, icon_keyword, explanation_long, steps });
+    const targetGoalName = goalName || user.goals?.[0]?.name || 'General';
+    let goal = (user.goals || []).find((g) => g.name === targetGoalName);
+    if (!goal) {
+      user.goals.push({ name: targetGoalName, saved_tasks: [] });
+      goal = user.goals[user.goals.length - 1];
+    }
+
+    goal.saved_tasks.push({ title, icon_keyword, explanation_long, steps });
     await user.save();
-    return res.json({ ok: true });
+    return res.json({ ok: true, goal: targetGoalName });
   } catch (err) {
     console.error('POST /api/tips/save error:', err);
     return res.status(500).json({ error: 'Failed to save tip' });
@@ -191,7 +219,7 @@ app.get('/api/tips/saved/:userId', async (req, res) => {
     const { userId } = req.params;
     const user = await User.findById(userId).lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
-    return res.json({ saved_tips: user.saved_tips || [] });
+    return res.json({ goals: user.goals || [] });
   } catch (err) {
     console.error('GET /api/tips/saved/:userId error:', err);
     return res.status(500).json({ error: 'Failed to load saved tips' });
